@@ -1,6 +1,8 @@
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import argparse
 import logging
-import os
 import os.path as osp
 import pprint
 
@@ -26,6 +28,7 @@ from util.dist_helper import setup_distributed
 from util.thresh_helper import ThreshController
 from einops import rearrange
 import random
+from torch.utils.tensorboard import SummaryWriter
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -36,17 +39,22 @@ parser.add_argument('--unlabeled_id_path', type=str, default=osp.join(osp.dirnam
 parser.add_argument('--val_id_path', type=str, default=osp.join(osp.dirname(__file__), "partitions/cityscapes/val.txt"))
 parser.add_argument('--local_rank', default=0, type=int)
 parser.add_argument('--port', default=0, type=int)
-parser.add_argument('--save_path', default=osp.join(osp.dirname(__file__), 'experiments/models/corrmatch_ver3_2'), type=str)
+parser.add_argument('--save_path', default=osp.join(osp.dirname(__file__), 'experiments/models/1019_corrmatch_ver3'), type=str)
+parser.add_argument('--log_path', default=osp.join(osp.dirname(__file__), 'experiments/logs/1019_corrmatch_ver3'), type=str)
 
 def init_seeds(seed=0, cuda_deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)  # 싱글 GPU 시드 고정
+    
     cudnn.enabled = True
     # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
     if cuda_deterministic:  # slower, more reproducible
         cudnn.deterministic = True
         cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        
     else:  # faster, less reproducible
         cudnn.deterministic = False
         cudnn.benchmark = True
@@ -68,7 +76,8 @@ def main():
 
     if rank == 0:
         os.makedirs(args.save_path, exist_ok=True)
-    init_seeds(0, False)
+    # init_seeds(0, False)
+    init_seeds(0, True)
 
     model = DeepLabV3Plus(cfg)
     # sam = sam_model_registry["vit_b"](checkpoint="sam/checkpoints/sam_vit_b.pth")
@@ -78,6 +87,8 @@ def main():
         logger.info('Total params: {:.1f}M\n'.format(utils.count_params(model)))
         utils.compute_flops(cfg, model, logger)
 
+    # 텐서보드 추가
+    tb_writer = SummaryWriter(log_dir=args.log_path)
 
     optimizer = SGD([{'params': model.backbone.parameters(), 'lr': cfg['lr']},
                      {'params': [param for name, param in model.named_parameters() if 'backbone' not in name],
@@ -340,6 +351,16 @@ def main():
                     total_loss_w_fp / (i + 1), total_mask_ratio / (i + 1), total_loss_corr_u / (i + 1)))
                 tbar.update(1)
 
+        # Tensorboard 추가
+        tb_writer.add_scalar('Loss/total_loss', total_loss / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_x', total_loss_x / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_s', total_loss_s / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_kl', total_loss_kl / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_w_fp', total_loss_w_fp / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_corr_ce', total_loss_corr_ce / (i + 1), epoch)
+        tb_writer.add_scalar('Loss/loss_corr_u', total_loss_corr_u / (i + 1), epoch)
+
+
         if accum_counter > 0:
             scaler.step(optimizer)
             scaler.update()
@@ -356,7 +377,8 @@ def main():
         eval_mode = 'original'
         
         torch.cuda.empty_cache()
-        res_val = evaluate(model, rank, valloader, eval_mode, cfg)
+        # res_val = evaluate(model, rank, valloader, eval_mode, cfg)
+        res_val = evaluate(model, valloader, eval_mode, cfg)
         mIOU = res_val['mIOU']
         class_IOU = res_val['iou_class']
         if rank != 0:
@@ -382,6 +404,8 @@ def main():
         if rank != 0:
             torch.distributed.barrier()
         torch.cuda.empty_cache()
+    
+    tb_writer.close()
 
 
 if __name__ == '__main__':
